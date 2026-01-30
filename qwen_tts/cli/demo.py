@@ -18,8 +18,11 @@ A gradio demo for Qwen3 TTS models.
 """
 
 import argparse
+import io
 import os
 import tempfile
+import time
+import wave
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -134,6 +137,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Gradio queue concurrency (default: 16).",
     )
 
+    # Optional multi-model UI args
+    parser.add_argument(
+        "--base-checkpoint",
+        default=None,
+        help=(
+            "Optional Base model checkpoint (HF repo id / local path). "
+            "If set while launching a CustomVoice model, the Web UI will also "
+            "include voice-clone tabs powered by this Base checkpoint."
+        ),
+    )
+
     # HTTPS args
     parser.add_argument(
         "--ssl-certfile",
@@ -243,6 +257,50 @@ def _wav_to_gradio_audio(wav: np.ndarray, sr: int) -> Tuple[int, np.ndarray]:
     return sr, wav
 
 
+def _wav_to_wav_bytes(wav: np.ndarray, sr: int) -> bytes:
+    wav = _normalize_audio(wav)
+    sr = int(sr) if sr is not None else 24000
+
+    # Float32 [-1, 1] -> int16 PCM.
+    wav_i16 = (np.clip(wav, -1.0, 1.0) * 32767.0).astype(np.int16)
+    wav_i16 = np.ascontiguousarray(wav_i16)
+
+    with io.BytesIO() as buf:
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sr)
+            wf.writeframes(wav_i16.tobytes())
+        return buf.getvalue()
+
+
+def _append_with_crossfade(
+    acc: np.ndarray,
+    chunk: np.ndarray,
+    *,
+    sr: int,
+    crossfade_ms: float = 0.0,
+) -> np.ndarray:
+    acc = np.asarray(acc, dtype=np.float32)
+    chunk = np.asarray(chunk, dtype=np.float32)
+    if acc.size == 0:
+        return chunk.copy()
+    if chunk.size == 0:
+        return acc
+
+    cf_ms = float(crossfade_ms or 0.0)
+    if cf_ms <= 0:
+        return np.concatenate([acc, chunk], axis=0)
+
+    n = int(round((cf_ms / 1000.0) * float(sr)))
+    if n <= 0 or acc.shape[0] < n or chunk.shape[0] < n:
+        return np.concatenate([acc, chunk], axis=0)
+
+    fade = np.linspace(0.0, 1.0, num=n, dtype=np.float32)
+    mixed = acc[-n:] * (1.0 - fade) + chunk[:n] * fade
+    return np.concatenate([acc[:-n], mixed, chunk[n:]], axis=0)
+
+
 def _detect_model_kind(ckpt: str, tts: Qwen3TTSModel) -> str:
     mt = getattr(tts.model, "tts_model_type", None)
     if mt in ("custom_voice", "voice_design", "base"):
@@ -251,7 +309,14 @@ def _detect_model_kind(ckpt: str, tts: Qwen3TTSModel) -> str:
         raise ValueError(f"Unknown Qwen-TTS model type: {mt}")
 
 
-def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]) -> gr.Blocks:
+def build_demo(
+    tts: Qwen3TTSModel,
+    ckpt: str,
+    gen_kwargs_default: Dict[str, Any],
+    *,
+    tts_base: Optional[Qwen3TTSModel] = None,
+    ckpt_base: Optional[str] = None,
+) -> gr.Blocks:
     model_kind = _detect_model_kind(ckpt, tts)
 
     supported_langs_raw = None
@@ -264,6 +329,16 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
 
     lang_choices_disp, lang_map = _build_choices_and_map([x for x in (supported_langs_raw or [])])
     spk_choices_disp, spk_map = _build_choices_and_map([x for x in (supported_spks_raw or [])])
+
+    # Base model language options (used when the UI includes voice-clone tabs).
+    lang_choices_disp_base = lang_choices_disp
+    lang_map_base = lang_map
+    if tts_base is not None and callable(getattr(tts_base.model, "get_supported_languages", None)):
+        supported_langs_base_raw = tts_base.model.get_supported_languages()
+        lang_choices_disp_base, lang_map_base = _build_choices_and_map([x for x in (supported_langs_base_raw or [])])
+        if not lang_choices_disp_base:
+            lang_choices_disp_base = lang_choices_disp
+            lang_map_base = lang_map
 
     def _gen_common_kwargs() -> Dict[str, Any]:
         return dict(gen_kwargs_default)
@@ -283,7 +358,10 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
 """
         )
 
-        if model_kind == "custom_voice":
+        if tts_base is not None:
+            gr.Markdown(f"**Base Checkpoint:** `{ckpt_base or '<unspecified>'}`  ")
+
+        def _build_custom_voice_ui() -> None:
             with gr.Row():
                 with gr.Column(scale=2):
                     text_in = gr.Textbox(
@@ -304,37 +382,403 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                             value="Vivian",
                             interactive=True,
                         )
-                    instruct_in = gr.Textbox(
-                        label="Instruction (Optional) (控制指令，可不输入)",
-                        lines=2,
-                        placeholder="e.g. Say it in a very angry tone (例如：用特别伤心的语气说).",
-                    )
-                    btn = gr.Button("Generate (生成)", variant="primary")
-                with gr.Column(scale=3):
-                    audio_out = gr.Audio(label="Output Audio (合成结果)", type="numpy")
-                    err = gr.Textbox(label="Status (状态)", lines=2)
+                        instruct_in = gr.Textbox(
+                            label="Instruction (Optional) (控制指令，可不输入)",
+                            lines=2,
+                            placeholder="e.g. Say it in a very angry tone (例如：用特别伤心的语气说).",
+                        )
+                        with gr.Row():
+                            btn = gr.Button("Generate (生成)", variant="primary")
+                            cancel_btn = gr.Button("Cancel (取消)")
+                    with gr.Column(scale=3):
+                        audio_out = gr.Audio(
+                            label="Output Audio (合成结果)",
+                            type="numpy",
+                            autoplay=False,
+                            interactive=False,
+                            editable=False,
+                        )
+                        err = gr.Textbox(label="Status (状态)", lines=2)
 
-            def run_instruct(text: str, lang_disp: str, spk_disp: str, instruct: str):
-                try:
-                    if not text or not text.strip():
-                        return None, "Text is required (必须填写文本)."
-                    if not spk_disp:
-                        return None, "Speaker is required (必须选择说话人)."
-                    language = lang_map.get(lang_disp, "Auto")
-                    speaker = spk_map.get(spk_disp, spk_disp)
-                    kwargs = _gen_common_kwargs()
-                    wavs, sr = tts.generate_custom_voice(
-                        text=text.strip(),
-                        language=language,
-                        speaker=speaker,
-                        instruct=(instruct or "").strip() or None,
-                        **kwargs,
-                    )
-                    return _wav_to_gradio_audio(wavs[0], sr), "Finished. (生成完成)"
-                except Exception as e:
-                    return None, f"{type(e).__name__}: {e}"
+                def run_instruct(text: str, lang_disp: str, spk_disp: str, instruct: str):
+                    try:
+                        if not text or not text.strip():
+                            yield None, "Text is required (必须填写文本)."
+                            return
+                        if not spk_disp:
+                            yield None, "Speaker is required (必须选择说话人)."
+                            return
+                        language = lang_map.get(lang_disp, "Auto")
+                        speaker = spk_map.get(spk_disp, spk_disp)
+                        kwargs = _gen_common_kwargs()
+                        sr0 = None
+                        started_at = time.time()
+                        wav_acc = np.zeros((0,), dtype=np.float32)
+                        yield gr.update(value=None, playback_position=0), "Generating... (开始生成)"
+                        for wav, sr in tts.generate_custom_voice_stream(
+                            text=text.strip(),
+                            language=language,
+                            speaker=speaker,
+                            instruct=(instruct or "").strip() or None,
+                            chunk_seconds=1.0,
+                            left_context_frames=25,
+                            **kwargs,
+                        ):
+                            if sr0 is None:
+                                sr0 = int(sr)
+                                started_at = time.time()
+                            wav_acc = _append_with_crossfade(wav_acc, wav, sr=sr0, crossfade_ms=10.0)
+                            dur = float(wav_acc.shape[0]) / float(sr0) if sr0 > 0 else 0.0
+                            elapsed = time.time() - started_at
+                            pos = min(elapsed, max(dur - 0.1, 0.0))
+                            yield gr.update(value=_wav_to_gradio_audio(wav_acc, sr0), playback_position=pos), (
+                                f"Streaming... {dur:.1f}s (流式生成中)"
+                            )
+                        yield gr.update(playback_position=0), "Finished. (生成完成)"
+                        return
+                    except GeneratorExit:
+                        return
+                    except Exception as e:
+                        yield None, f"{type(e).__name__}: {e}"
+                        return
 
-            btn.click(run_instruct, inputs=[text_in, lang_in, spk_in, instruct_in], outputs=[audio_out, err])
+                gen_evt = btn.click(run_instruct, inputs=[text_in, lang_in, spk_in, instruct_in], outputs=[audio_out, err])
+                cancel_btn.click(fn=lambda: "Cancelled. (已取消)", outputs=[err], cancels=[gen_evt])
+
+        def _build_voice_clone_tabs(
+            tts_clone: Qwen3TTSModel,
+            lang_choices_disp_clone: List[str],
+            lang_map_clone: Dict[str, str],
+        ) -> None:
+            with gr.Tab("Clone & Generate (克隆并合成)"):
+                with gr.Row():
+                    with gr.Column(scale=2):
+                        ref_audio = gr.Audio(
+                            label="Reference Audio (参考音频)",
+                        )
+                        ref_max_sec = gr.Number(
+                            label="Reference Max Seconds (参考音频最大秒数，建议 2-4；0 表示不裁剪)",
+                            value=4.0,
+                            precision=1,
+                        )
+                        ref_text = gr.Textbox(
+                            label="Reference Text (参考音频文本)",
+                            lines=2,
+                            placeholder="Required if not set use x-vector only (不勾选use x-vector only时必填).",
+                        )
+                        xvec_only = gr.Checkbox(
+                            label="Use x-vector only (仅用说话人向量，效果有限，但不用传入参考音频文本)",
+                            value=False,
+                        )
+
+                    with gr.Column(scale=2):
+                        text_in = gr.Textbox(
+                            label="Target Text (待合成文本)",
+                            lines=4,
+                            placeholder="Enter text to synthesize (输入要合成的文本).",
+                        )
+                        lang_in = gr.Dropdown(
+                            label="Language (语种)",
+                            choices=lang_choices_disp_clone,
+                            value="Auto",
+                            interactive=True,
+                        )
+                        with gr.Row():
+                            btn = gr.Button("Generate (生成)", variant="primary")
+                            cancel_btn = gr.Button("Cancel (取消)")
+
+                    with gr.Column(scale=3):
+                        audio_out = gr.Audio(
+                            label="Output Audio (合成结果)",
+                            type="numpy",
+                            autoplay=False,
+                            interactive=False,
+                            editable=False,
+                        )
+                        err = gr.Textbox(label="Status (状态)", lines=2)
+
+                def _trim_audio(at: Tuple[np.ndarray, int], max_sec: float) -> Tuple[np.ndarray, int]:
+                    wav, sr = at
+                    try:
+                        ms = float(max_sec)
+                    except Exception:
+                        return wav, sr
+                    if ms <= 0:
+                        return wav, sr
+                    n = int(ms * float(sr))
+                    if n <= 0:
+                        return wav, sr
+                    if wav.shape[0] <= n:
+                        return wav, sr
+                    return wav[:n].copy(), sr
+
+                def _dur_sec(at: Tuple[np.ndarray, int]) -> float:
+                    wav, sr = at
+                    try:
+                        sr_f = float(sr)
+                    except Exception:
+                        return 0.0
+                    if sr_f <= 0:
+                        return 0.0
+                    return float(wav.shape[0]) / sr_f
+
+                def run_voice_clone(
+                    ref_aud, ref_max_s: float, ref_txt: str, use_xvec: bool, text: str, lang_disp: str
+                ):
+                    try:
+                        if not text or not text.strip():
+                            yield None, "Target text is required (必须填写待合成文本)."
+                            return
+                        at = _audio_to_tuple(ref_aud)
+                        if at is None:
+                            yield None, "Reference audio is required (必须上传参考音频)."
+                            return
+                        dur0 = _dur_sec(at)
+                        at = _trim_audio(at, ref_max_s)
+                        dur1 = _dur_sec(at)
+                        if (not use_xvec) and (not ref_txt or not ref_txt.strip()):
+                            yield None, (
+                                "Reference text is required when use x-vector only is NOT enabled.\n"
+                                "(未勾选 use x-vector only 时，必须提供参考音频文本；否则请勾选 use x-vector only，但效果会变差.)"
+                            )
+                            return
+                        language = lang_map_clone.get(lang_disp, "Auto")
+                        kwargs = _gen_common_kwargs()
+                        sr0 = None
+                        started_at = time.time()
+                        wav_acc = np.zeros((0,), dtype=np.float32)
+                        yield gr.update(value=None, playback_position=0), "Generating... (开始生成)"
+                        for wav, sr in tts_clone.generate_voice_clone_stream(
+                            text=text.strip(),
+                            language=language,
+                            ref_audio=at,
+                            ref_text=(ref_txt.strip() if ref_txt else None),
+                            x_vector_only_mode=bool(use_xvec),
+                            chunk_seconds=1.0,
+                            left_context_frames=25,
+                            **kwargs,
+                        ):
+                            if sr0 is None:
+                                sr0 = int(sr)
+                                started_at = time.time()
+                            wav_acc = _append_with_crossfade(wav_acc, wav, sr=sr0, crossfade_ms=10.0)
+                            dur = float(wav_acc.shape[0]) / float(sr0) if sr0 > 0 else 0.0
+                            elapsed = time.time() - started_at
+                            pos = min(elapsed, max(dur - 0.1, 0.0))
+                            yield gr.update(value=_wav_to_gradio_audio(wav_acc, sr0), playback_position=pos), (
+                                f"Streaming... {dur:.1f}s (流式生成中)"
+                            )
+                        if dur1 + 1e-6 < dur0:
+                            yield gr.update(playback_position=0), (
+                                f"Finished. Reference audio trimmed: {dur0:.1f}s -> {dur1:.1f}s. "
+                                f"(生成完成；参考音频已裁剪：{dur0:.1f}s -> {dur1:.1f}s)"
+                            )
+                        else:
+                            yield gr.update(playback_position=0), "Finished. (生成完成)"
+                        return
+                    except GeneratorExit:
+                        return
+                    except Exception as e:
+                        yield None, f"{type(e).__name__}: {e}"
+                        return
+
+                gen_evt = btn.click(
+                    run_voice_clone,
+                    inputs=[ref_audio, ref_max_sec, ref_text, xvec_only, text_in, lang_in],
+                    outputs=[audio_out, err],
+                )
+                cancel_btn.click(fn=lambda: "Cancelled. (已取消)", outputs=[err], cancels=[gen_evt])
+
+            with gr.Tab("Save / Load Voice (保存/加载克隆音色)"):
+                with gr.Row():
+                    with gr.Column(scale=2):
+                        gr.Markdown(
+                            """
+### Save Voice (保存音色)
+Upload reference audio and text, choose use x-vector only or not, then save a reusable voice prompt file.  
+(上传参考音频和参考文本，选择是否使用 use x-vector only 模式后保存为可复用的音色文件)
+"""
+                        )
+                        ref_audio_s = gr.Audio(label="Reference Audio (参考音频)", type="numpy")
+                        ref_max_sec_s = gr.Number(
+                            label="Reference Max Seconds (参考音频最大秒数，建议 2-4；0 表示不裁剪)",
+                            value=4.0,
+                            precision=1,
+                        )
+                        ref_text_s = gr.Textbox(
+                            label="Reference Text (参考音频文本)",
+                            lines=2,
+                            placeholder="Required if not set use x-vector only (不勾选use x-vector only时必填).",
+                        )
+                        xvec_only_s = gr.Checkbox(
+                            label="Use x-vector only (仅用说话人向量，效果有限，但不用传入参考音频文本)",
+                            value=False,
+                        )
+                        save_btn = gr.Button("Save Voice File (保存音色文件)", variant="primary")
+                        prompt_file_out = gr.File(label="Voice File (音色文件)")
+
+                    with gr.Column(scale=2):
+                        gr.Markdown(
+                            """
+### Load Voice & Generate (加载音色并合成)
+Upload a previously saved voice file, then synthesize new text.  
+(上传已保存提示文件后，输入新文本进行合成)
+"""
+                        )
+                        prompt_file_in = gr.File(label="Upload Prompt File (上传提示文件)")
+                        text_in2 = gr.Textbox(
+                            label="Target Text (待合成文本)",
+                            lines=4,
+                            placeholder="Enter text to synthesize (输入要合成的文本).",
+                        )
+                        lang_in2 = gr.Dropdown(
+                            label="Language (语种)",
+                            choices=lang_choices_disp_clone,
+                            value="Auto",
+                            interactive=True,
+                        )
+                        with gr.Row():
+                            gen_btn2 = gr.Button("Generate (生成)", variant="primary")
+                            cancel_btn2 = gr.Button("Cancel (取消)")
+
+                    with gr.Column(scale=3):
+                        audio_out2 = gr.Audio(
+                            label="Output Audio (合成结果)",
+                            type="numpy",
+                            autoplay=False,
+                            interactive=False,
+                            editable=False,
+                        )
+                        err2 = gr.Textbox(label="Status (状态)", lines=2)
+
+                def save_prompt(ref_aud, ref_max_s: float, ref_txt: str, use_xvec: bool):
+                    try:
+                        at = _audio_to_tuple(ref_aud)
+                        if at is None:
+                            return None, "Reference audio is required (必须上传参考音频)."
+                        dur0 = _dur_sec(at)
+                        at = _trim_audio(at, ref_max_s)
+                        dur1 = _dur_sec(at)
+                        if (not use_xvec) and (not ref_txt or not ref_txt.strip()):
+                            return None, (
+                                "Reference text is required when use x-vector only is NOT enabled.\n"
+                                "(未勾选 use x-vector only 时，必须提供参考音频文本；否则请勾选 use x-vector only，但效果会变差.)"
+                            )
+                        items = tts_clone.create_voice_clone_prompt(
+                            ref_audio=at,
+                            ref_text=(ref_txt.strip() if ref_txt else None),
+                            x_vector_only_mode=bool(use_xvec),
+                        )
+                        payload = {
+                            "items": [asdict(it) for it in items],
+                        }
+                        fd, out_path = tempfile.mkstemp(prefix="voice_clone_prompt_", suffix=".pt")
+                        os.close(fd)
+                        torch.save(payload, out_path)
+                        if dur1 + 1e-6 < dur0:
+                            return out_path, (
+                                f"Finished. Reference audio trimmed: {dur0:.1f}s -> {dur1:.1f}s. "
+                                f"(生成完成；参考音频已裁剪：{dur0:.1f}s -> {dur1:.1f}s)"
+                            )
+                        return out_path, "Finished. (生成完成)"
+                    except Exception as e:
+                        return None, f"{type(e).__name__}: {e}"
+
+                def load_prompt_and_gen(file_obj, text: str, lang_disp: str):
+                    try:
+                        if file_obj is None:
+                            yield None, "Voice file is required (必须上传音色文件)."
+                            return
+                        if not text or not text.strip():
+                            yield None, "Target text is required (必须填写待合成文本)."
+                            return
+
+                        path = getattr(file_obj, "name", None) or getattr(file_obj, "path", None) or str(file_obj)
+                        payload = torch.load(path, map_location="cpu", weights_only=True)
+                        if not isinstance(payload, dict) or "items" not in payload:
+                            yield None, "Invalid file format (文件格式不正确)."
+                            return
+
+                        items_raw = payload["items"]
+                        if not isinstance(items_raw, list) or len(items_raw) == 0:
+                            yield None, "Empty voice items (音色为空)."
+                            return
+
+                        items: List[VoiceClonePromptItem] = []
+                        for d in items_raw:
+                            if not isinstance(d, dict):
+                                yield None, "Invalid item format in file (文件内部格式错误)."
+                                return
+
+                            ref_code = d.get("ref_code", None)
+                            if ref_code is not None and not torch.is_tensor(ref_code):
+                                ref_code = torch.tensor(ref_code)
+
+                            ref_spk = d.get("ref_spk_embedding", None)
+                            if ref_spk is None:
+                                yield None, "Missing ref_spk_embedding (缺少说话人向量)."
+                                return
+                            if not torch.is_tensor(ref_spk):
+                                ref_spk = torch.tensor(ref_spk)
+
+                            items.append(
+                                VoiceClonePromptItem(
+                                    ref_code=ref_code,
+                                    ref_spk_embedding=ref_spk,
+                                    x_vector_only_mode=bool(d.get("x_vector_only_mode", False)),
+                                    icl_mode=bool(d.get("icl_mode", not bool(d.get("x_vector_only_mode", False)))),
+                                    ref_text=d.get("ref_text", None),
+                                )
+                            )
+
+                        language = lang_map_clone.get(lang_disp, "Auto")
+                        kwargs = _gen_common_kwargs()
+                        sr0 = None
+                        started_at = time.time()
+                        wav_acc = np.zeros((0,), dtype=np.float32)
+                        yield gr.update(value=None, playback_position=0), "Generating... (开始生成)"
+                        for wav, sr in tts_clone.generate_voice_clone_stream(
+                            text=text.strip(),
+                            language=language,
+                            voice_clone_prompt=items,
+                            chunk_seconds=1.0,
+                            left_context_frames=25,
+                            **kwargs,
+                        ):
+                            if sr0 is None:
+                                sr0 = int(sr)
+                                started_at = time.time()
+                            wav_acc = _append_with_crossfade(wav_acc, wav, sr=sr0, crossfade_ms=10.0)
+                            dur = float(wav_acc.shape[0]) / float(sr0) if sr0 > 0 else 0.0
+                            elapsed = time.time() - started_at
+                            pos = min(elapsed, max(dur - 0.1, 0.0))
+                            yield gr.update(value=_wav_to_gradio_audio(wav_acc, sr0), playback_position=pos), (
+                                f"Streaming... {dur:.1f}s (流式生成中)"
+                            )
+                        yield gr.update(playback_position=0), "Finished. (生成完成)"
+                        return
+                    except GeneratorExit:
+                        return
+                    except Exception as e:
+                        yield None, (
+                            "Failed to read or use voice file. Check file format/content.\n"
+                            "(读取或使用音色文件失败，请检查文件格式或内容)\n"
+                            f"{type(e).__name__}: {e}"
+                        )
+                        return
+
+                save_btn.click(save_prompt, inputs=[ref_audio_s, ref_max_sec_s, ref_text_s, xvec_only_s], outputs=[prompt_file_out, err2])
+                gen_evt2 = gen_btn2.click(load_prompt_and_gen, inputs=[prompt_file_in, text_in2, lang_in2], outputs=[audio_out2, err2])
+                cancel_btn2.click(fn=lambda: "Cancelled. (已取消)", outputs=[err2], cancels=[gen_evt2])
+
+        if model_kind == "custom_voice":
+            if tts_base is not None:
+                with gr.Tabs():
+                    with gr.Tab("Custom Voice (内置音色)"):
+                        _build_custom_voice_ui()
+                    _build_voice_clone_tabs(tts_base, lang_choices_disp_base, lang_map_base)
+            else:
+                _build_custom_voice_ui()
 
         elif model_kind == "voice_design":
             with gr.Row():
@@ -351,235 +795,70 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                             value="Auto",
                             interactive=True,
                         )
-                    design_in = gr.Textbox(
-                        label="Voice Design Instruction (音色描述)",
-                        lines=3,
-                        value="Speak in an incredulous tone, but with a hint of panic beginning to creep into your voice."
-                    )
-                    btn = gr.Button("Generate (生成)", variant="primary")
-                with gr.Column(scale=3):
-                    audio_out = gr.Audio(label="Output Audio (合成结果)", type="numpy")
-                    err = gr.Textbox(label="Status (状态)", lines=2)
+                        design_in = gr.Textbox(
+                            label="Voice Design Instruction (音色描述)",
+                            lines=3,
+                            value="Speak in an incredulous tone, but with a hint of panic beginning to creep into your voice."
+                        )
+                        with gr.Row():
+                            btn = gr.Button("Generate (生成)", variant="primary")
+                            cancel_btn = gr.Button("Cancel (取消)")
+                    with gr.Column(scale=3):
+                        audio_out = gr.Audio(
+                            label="Output Audio (合成结果)",
+                            type="numpy",
+                            autoplay=False,
+                            interactive=False,
+                            editable=False,
+                        )
+                        err = gr.Textbox(label="Status (状态)", lines=2)
 
-            def run_voice_design(text: str, lang_disp: str, design: str):
-                try:
-                    if not text or not text.strip():
-                        return None, "Text is required (必须填写文本)."
-                    if not design or not design.strip():
-                        return None, "Voice design instruction is required (必须填写音色描述)."
-                    language = lang_map.get(lang_disp, "Auto")
-                    kwargs = _gen_common_kwargs()
-                    wavs, sr = tts.generate_voice_design(
-                        text=text.strip(),
-                        language=language,
-                        instruct=design.strip(),
-                        **kwargs,
-                    )
-                    return _wav_to_gradio_audio(wavs[0], sr), "Finished. (生成完成)"
-                except Exception as e:
-                    return None, f"{type(e).__name__}: {e}"
+                def run_voice_design(text: str, lang_disp: str, design: str):
+                    try:
+                        if not text or not text.strip():
+                            yield None, "Text is required (必须填写文本)."
+                            return
+                        if not design or not design.strip():
+                            yield None, "Voice design instruction is required (必须填写音色描述)."
+                            return
+                        language = lang_map.get(lang_disp, "Auto")
+                        kwargs = _gen_common_kwargs()
+                        sr0 = None
+                        started_at = time.time()
+                        wav_acc = np.zeros((0,), dtype=np.float32)
+                        yield gr.update(value=None, playback_position=0), "Generating... (开始生成)"
+                        for wav, sr in tts.generate_voice_design_stream(
+                            text=text.strip(),
+                            language=language,
+                            instruct=design.strip(),
+                            chunk_seconds=1.0,
+                            left_context_frames=25,
+                            **kwargs,
+                        ):
+                            if sr0 is None:
+                                sr0 = int(sr)
+                                started_at = time.time()
+                            wav_acc = _append_with_crossfade(wav_acc, wav, sr=sr0, crossfade_ms=10.0)
+                            dur = float(wav_acc.shape[0]) / float(sr0) if sr0 > 0 else 0.0
+                            elapsed = time.time() - started_at
+                            pos = min(elapsed, max(dur - 0.1, 0.0))
+                            yield gr.update(value=_wav_to_gradio_audio(wav_acc, sr0), playback_position=pos), (
+                                f"Streaming... {dur:.1f}s (流式生成中)"
+                            )
+                        yield gr.update(playback_position=0), "Finished. (生成完成)"
+                        return
+                    except GeneratorExit:
+                        return
+                    except Exception as e:
+                        yield None, f"{type(e).__name__}: {e}"
+                        return
 
-            btn.click(run_voice_design, inputs=[text_in, lang_in, design_in], outputs=[audio_out, err])
+                gen_evt = btn.click(run_voice_design, inputs=[text_in, lang_in, design_in], outputs=[audio_out, err])
+                cancel_btn.click(fn=lambda: "Cancelled. (已取消)", outputs=[err], cancels=[gen_evt])
 
         else:  # voice_clone for base
             with gr.Tabs():
-                with gr.Tab("Clone & Generate (克隆并合成)"):
-                    with gr.Row():
-                        with gr.Column(scale=2):
-                            ref_audio = gr.Audio(
-                                label="Reference Audio (参考音频)",
-                            )
-                            ref_text = gr.Textbox(
-                                label="Reference Text (参考音频文本)",
-                                lines=2,
-                                placeholder="Required if not set use x-vector only (不勾选use x-vector only时必填).",
-                            )
-                            xvec_only = gr.Checkbox(
-                                label="Use x-vector only (仅用说话人向量，效果有限，但不用传入参考音频文本)",
-                                value=False,
-                            )
-
-                        with gr.Column(scale=2):
-                            text_in = gr.Textbox(
-                                label="Target Text (待合成文本)",
-                                lines=4,
-                                placeholder="Enter text to synthesize (输入要合成的文本).",
-                            )
-                            lang_in = gr.Dropdown(
-                                label="Language (语种)",
-                                choices=lang_choices_disp,
-                                value="Auto",
-                                interactive=True,
-                            )
-                            btn = gr.Button("Generate (生成)", variant="primary")
-
-                        with gr.Column(scale=3):
-                            audio_out = gr.Audio(label="Output Audio (合成结果)", type="numpy")
-                            err = gr.Textbox(label="Status (状态)", lines=2)
-
-                    def run_voice_clone(ref_aud, ref_txt: str, use_xvec: bool, text: str, lang_disp: str):
-                        try:
-                            if not text or not text.strip():
-                                return None, "Target text is required (必须填写待合成文本)."
-                            at = _audio_to_tuple(ref_aud)
-                            if at is None:
-                                return None, "Reference audio is required (必须上传参考音频)."
-                            if (not use_xvec) and (not ref_txt or not ref_txt.strip()):
-                                return None, (
-                                    "Reference text is required when use x-vector only is NOT enabled.\n"
-                                    "(未勾选 use x-vector only 时，必须提供参考音频文本；否则请勾选 use x-vector only，但效果会变差.)"
-                                )
-                            language = lang_map.get(lang_disp, "Auto")
-                            kwargs = _gen_common_kwargs()
-                            wavs, sr = tts.generate_voice_clone(
-                                text=text.strip(),
-                                language=language,
-                                ref_audio=at,
-                                ref_text=(ref_txt.strip() if ref_txt else None),
-                                x_vector_only_mode=bool(use_xvec),
-                                **kwargs,
-                            )
-                            return _wav_to_gradio_audio(wavs[0], sr), "Finished. (生成完成)"
-                        except Exception as e:
-                            return None, f"{type(e).__name__}: {e}"
-
-                    btn.click(
-                        run_voice_clone,
-                        inputs=[ref_audio, ref_text, xvec_only, text_in, lang_in],
-                        outputs=[audio_out, err],
-                    )
-
-                with gr.Tab("Save / Load Voice (保存/加载克隆音色)"):
-                    with gr.Row():
-                        with gr.Column(scale=2):
-                            gr.Markdown(
-                                """
-### Save Voice (保存音色)
-Upload reference audio and text, choose use x-vector only or not, then save a reusable voice prompt file.  
-(上传参考音频和参考文本，选择是否使用 use x-vector only 模式后保存为可复用的音色文件)
-"""
-                            )
-                            ref_audio_s = gr.Audio(label="Reference Audio (参考音频)", type="numpy")
-                            ref_text_s = gr.Textbox(
-                                label="Reference Text (参考音频文本)",
-                                lines=2,
-                                placeholder="Required if not set use x-vector only (不勾选use x-vector only时必填).",
-                            )
-                            xvec_only_s = gr.Checkbox(
-                                label="Use x-vector only (仅用说话人向量，效果有限，但不用传入参考音频文本)",
-                                value=False,
-                            )
-                            save_btn = gr.Button("Save Voice File (保存音色文件)", variant="primary")
-                            prompt_file_out = gr.File(label="Voice File (音色文件)")
-
-                        with gr.Column(scale=2):
-                            gr.Markdown(
-                                """
-### Load Voice & Generate (加载音色并合成)
-Upload a previously saved voice file, then synthesize new text.  
-(上传已保存提示文件后，输入新文本进行合成)
-"""
-                            )
-                            prompt_file_in = gr.File(label="Upload Prompt File (上传提示文件)")
-                            text_in2 = gr.Textbox(
-                                label="Target Text (待合成文本)",
-                                lines=4,
-                                placeholder="Enter text to synthesize (输入要合成的文本).",
-                            )
-                            lang_in2 = gr.Dropdown(
-                                label="Language (语种)",
-                                choices=lang_choices_disp,
-                                value="Auto",
-                                interactive=True,
-                            )
-                            gen_btn2 = gr.Button("Generate (生成)", variant="primary")
-
-                        with gr.Column(scale=3):
-                            audio_out2 = gr.Audio(label="Output Audio (合成结果)", type="numpy")
-                            err2 = gr.Textbox(label="Status (状态)", lines=2)
-
-                    def save_prompt(ref_aud, ref_txt: str, use_xvec: bool):
-                        try:
-                            at = _audio_to_tuple(ref_aud)
-                            if at is None:
-                                return None, "Reference audio is required (必须上传参考音频)."
-                            if (not use_xvec) and (not ref_txt or not ref_txt.strip()):
-                                return None, (
-                                    "Reference text is required when use x-vector only is NOT enabled.\n"
-                                    "(未勾选 use x-vector only 时，必须提供参考音频文本；否则请勾选 use x-vector only，但效果会变差.)"
-                                )
-                            items = tts.create_voice_clone_prompt(
-                                ref_audio=at,
-                                ref_text=(ref_txt.strip() if ref_txt else None),
-                                x_vector_only_mode=bool(use_xvec),
-                            )
-                            payload = {
-                                "items": [asdict(it) for it in items],
-                            }
-                            fd, out_path = tempfile.mkstemp(prefix="voice_clone_prompt_", suffix=".pt")
-                            os.close(fd)
-                            torch.save(payload, out_path)
-                            return out_path, "Finished. (生成完成)"
-                        except Exception as e:
-                            return None, f"{type(e).__name__}: {e}"
-
-                    def load_prompt_and_gen(file_obj, text: str, lang_disp: str):
-                        try:
-                            if file_obj is None:
-                                return None, "Voice file is required (必须上传音色文件)."
-                            if not text or not text.strip():
-                                return None, "Target text is required (必须填写待合成文本)."
-
-                            path = getattr(file_obj, "name", None) or getattr(file_obj, "path", None) or str(file_obj)
-                            payload = torch.load(path, map_location="cpu", weights_only=True)
-                            if not isinstance(payload, dict) or "items" not in payload:
-                                return None, "Invalid file format (文件格式不正确)."
-
-                            items_raw = payload["items"]
-                            if not isinstance(items_raw, list) or len(items_raw) == 0:
-                                return None, "Empty voice items (音色为空)."
-
-                            items: List[VoiceClonePromptItem] = []
-                            for d in items_raw:
-                                if not isinstance(d, dict):
-                                    return None, "Invalid item format in file (文件内部格式错误)."
-                                ref_code = d.get("ref_code", None)
-                                if ref_code is not None and not torch.is_tensor(ref_code):
-                                    ref_code = torch.tensor(ref_code)
-                                ref_spk = d.get("ref_spk_embedding", None)
-                                if ref_spk is None:
-                                    return None, "Missing ref_spk_embedding (缺少说话人向量)."
-                                if not torch.is_tensor(ref_spk):
-                                    ref_spk = torch.tensor(ref_spk)
-
-                                items.append(
-                                    VoiceClonePromptItem(
-                                        ref_code=ref_code,
-                                        ref_spk_embedding=ref_spk,
-                                        x_vector_only_mode=bool(d.get("x_vector_only_mode", False)),
-                                        icl_mode=bool(d.get("icl_mode", not bool(d.get("x_vector_only_mode", False)))),
-                                        ref_text=d.get("ref_text", None),
-                                    )
-                                )
-
-                            language = lang_map.get(lang_disp, "Auto")
-                            kwargs = _gen_common_kwargs()
-                            wavs, sr = tts.generate_voice_clone(
-                                text=text.strip(),
-                                language=language,
-                                voice_clone_prompt=items,
-                                **kwargs,
-                            )
-                            return _wav_to_gradio_audio(wavs[0], sr), "Finished. (生成完成)"
-                        except Exception as e:
-                            return None, (
-                                f"Failed to read or use voice file. Check file format/content.\n"
-                                f"(读取或使用音色文件失败，请检查文件格式或内容)\n"
-                                f"{type(e).__name__}: {e}"
-                            )
-
-                    save_btn.click(save_prompt, inputs=[ref_audio_s, ref_text_s, xvec_only_s], outputs=[prompt_file_out, err2])
-                    gen_btn2.click(load_prompt_and_gen, inputs=[prompt_file_in, text_in2, lang_in2], outputs=[audio_out2, err2])
+                _build_voice_clone_tabs(tts, lang_choices_disp, lang_map)
 
         gr.Markdown(
             """
@@ -603,7 +882,18 @@ def main(argv=None) -> int:
     ckpt = _resolve_checkpoint(args)
 
     dtype = _dtype_from_str(args.dtype)
-    attn_impl = "flash_attention_2" if args.flash_attn else None
+    # Prefer PyTorch SDPA when FlashAttention-2 isn't explicitly enabled or isn't usable.
+    # This keeps the demo fast without requiring extra native dependencies.
+    if args.flash_attn:
+        try:
+            import flash_attn  # noqa: F401
+
+            attn_impl = "flash_attention_2"
+        except Exception:
+            print("flash-attn is not usable; falling back to attn_implementation='sdpa'.")
+            attn_impl = "sdpa"
+    else:
+        attn_impl = "sdpa"
 
     tts = Qwen3TTSModel.from_pretrained(
         ckpt,
@@ -613,7 +903,27 @@ def main(argv=None) -> int:
     )
 
     gen_kwargs_default = _collect_gen_kwargs(args)
-    demo = build_demo(tts, ckpt, gen_kwargs_default)
+    tts_base = None
+    ckpt_base = None
+    if args.base_checkpoint:
+        primary_kind = getattr(tts.model, "tts_model_type", None)
+        if primary_kind == "custom_voice":
+            ckpt_base = args.base_checkpoint
+            tts_base = Qwen3TTSModel.from_pretrained(
+                ckpt_base,
+                device_map=args.device,
+                dtype=dtype,
+                attn_implementation=attn_impl,
+            )
+            base_kind = getattr(tts_base.model, "tts_model_type", None)
+            if base_kind != "base":
+                raise ValueError(
+                    f"--base-checkpoint must point to a Base model, got tts_model_type={base_kind!r}: {ckpt_base}"
+                )
+        else:
+            print("--base-checkpoint is only applied when launching a CustomVoice model; ignoring.")
+
+    demo = build_demo(tts, ckpt, gen_kwargs_default, tts_base=tts_base, ckpt_base=ckpt_base)
 
     launch_kwargs: Dict[str, Any] = dict(
         server_name=args.ip,

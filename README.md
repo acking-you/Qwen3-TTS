@@ -126,6 +126,34 @@ cd Qwen3-TTS
 pip install -e .
 ```
 
+#### UV (Alternative)
+
+If you prefer `uv` for environment management, you can run the Web UI on this repo with:
+
+```bash
+uv venv --python 3.12
+# Install CUDA-enabled PyTorch (cu128) pinned to torch 2.9.* (works well with optional flash-attn wheels)
+uv pip install --index-url https://download.pytorch.org/whl/cu128 "torch==2.9.*" "torchaudio==2.9.*"
+uv pip install -e .
+
+# One-click Web UI (CustomVoice by default)
+./run_webui_uv.sh
+```
+
+To enable FlashAttention-2 (optional), you can let the script install a matching `flash-attn` wheel automatically:
+
+```bash
+./run_webui_uv.sh --install-flash-attn
+```
+
+To launch a CustomVoice model *and* include Base voice-clone tabs in the same Web UI:
+
+```bash
+./run_webui_uv.sh --with-base
+# or explicitly:
+./run_webui_uv.sh Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice --base-checkpoint Qwen/Qwen3-TTS-12Hz-0.6B-Base
+```
+
 Additionally, we recommend using FlashAttention 2 to reduce GPU memory usage.
 
 ```bash
@@ -241,6 +269,8 @@ sf.write("output_voice_design_2.wav", wavs[1], sr)
 #### Voice Clone
 
 For the voice clone model (`Qwen3-TTS-12Hz-1.7B/0.6B-Base`), to clone a voice and synthesize new content, you just need to provide a reference audio clip (`ref_audio`) along with its transcript (`ref_text`). `ref_audio` can be a local file path, a URL, a base64 string, or a `(numpy_array, sample_rate)` tuple. If you set `x_vector_only_mode=True`, only the speaker embedding is used so `ref_text` is not required, but cloning quality may be reduced.
+
+**Practical tip:** For best latency (especially in ICL mode, i.e. `x_vector_only_mode=False`), keep the reference clip short (recommended **2–4 seconds**). Very long reference audio can make generation *look stuck* because the decoder runs over the reference + generated codes.
 
 ```python
 import torch

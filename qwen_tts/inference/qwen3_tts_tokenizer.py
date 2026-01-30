@@ -13,6 +13,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
+import os
 import base64
 import io
 import urllib.request
@@ -25,13 +27,7 @@ import soundfile as sf
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoConfig, AutoFeatureExtractor, AutoModel
-
-from ..core import (
-    Qwen3TTSTokenizerV1Config,
-    Qwen3TTSTokenizerV1Model,
-    Qwen3TTSTokenizerV2Config,
-    Qwen3TTSTokenizerV2Model,
-)
+from transformers.utils.hub import cached_file
 
 AudioInput = Union[
     str,  # wav path, or base64 string
@@ -60,6 +56,77 @@ class Qwen3TTSTokenizer:
         self.config = None
         self.device = None
 
+    @staticmethod
+    def _safe_register(model_type: Optional[str]) -> None:
+        def _try_register():
+            if model_type == "qwen3_tts_tokenizer_12hz":
+                from ..core.tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Config
+                from ..core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Model
+
+                AutoConfig.register("qwen3_tts_tokenizer_12hz", Qwen3TTSTokenizerV2Config)
+                AutoModel.register(Qwen3TTSTokenizerV2Config, Qwen3TTSTokenizerV2Model)
+                return
+
+            if model_type == "qwen3_tts_tokenizer_25hz":
+                from ..core.tokenizer_25hz.configuration_qwen3_tts_tokenizer_v1 import Qwen3TTSTokenizerV1Config
+                from ..core.tokenizer_25hz.modeling_qwen3_tts_tokenizer_v1 import Qwen3TTSTokenizerV1Model
+
+                AutoConfig.register("qwen3_tts_tokenizer_25hz", Qwen3TTSTokenizerV1Config)
+                AutoModel.register(Qwen3TTSTokenizerV1Config, Qwen3TTSTokenizerV1Model)
+                return
+
+            # Fallback: register both variants.
+            from ..core.tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Config
+            from ..core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Model
+            from ..core.tokenizer_25hz.configuration_qwen3_tts_tokenizer_v1 import Qwen3TTSTokenizerV1Config
+            from ..core.tokenizer_25hz.modeling_qwen3_tts_tokenizer_v1 import Qwen3TTSTokenizerV1Model
+
+            AutoConfig.register("qwen3_tts_tokenizer_25hz", Qwen3TTSTokenizerV1Config)
+            AutoModel.register(Qwen3TTSTokenizerV1Config, Qwen3TTSTokenizerV1Model)
+            AutoConfig.register("qwen3_tts_tokenizer_12hz", Qwen3TTSTokenizerV2Config)
+            AutoModel.register(Qwen3TTSTokenizerV2Config, Qwen3TTSTokenizerV2Model)
+
+        try:
+            _try_register()
+        except ValueError:
+            # Already registered (e.g., due to multiple imports or other packages).
+            pass
+
+    @staticmethod
+    def _detect_model_type(pretrained_model_name_or_path: str, **kwargs) -> Optional[str]:
+        # Try to read the raw config.json first to avoid importing both tokenizer variants.
+        try:
+            config_path = cached_file(
+                pretrained_model_name_or_path,
+                "config.json",
+                subfolder=kwargs.get("subfolder", None),
+                cache_dir=kwargs.get("cache_dir", None),
+                force_download=kwargs.get("force_download", False),
+                proxies=kwargs.get("proxies", None),
+                resume_download=kwargs.get("resume_download", None),
+                local_files_only=kwargs.get("local_files_only", False),
+                token=kwargs.get("token", None) or kwargs.get("use_auth_token", None),
+                revision=kwargs.get("revision", None),
+            )
+        except Exception:
+            config_path = None
+
+        if not config_path and os.path.isdir(pretrained_model_name_or_path):
+            local_config = os.path.join(pretrained_model_name_or_path, "config.json")
+            if os.path.exists(local_config):
+                config_path = local_config
+
+        if not config_path:
+            return None
+
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            mt = data.get("model_type", None)
+            return str(mt) if mt is not None else None
+        except Exception:
+            return None
+
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs) -> "Qwen3TTSTokenizer":
         """
@@ -78,11 +145,8 @@ class Qwen3TTSTokenizer:
         """
         inst = cls()
 
-        AutoConfig.register("qwen3_tts_tokenizer_25hz", Qwen3TTSTokenizerV1Config)
-        AutoModel.register(Qwen3TTSTokenizerV1Config, Qwen3TTSTokenizerV1Model)
-
-        AutoConfig.register("qwen3_tts_tokenizer_12hz", Qwen3TTSTokenizerV2Config)
-        AutoModel.register(Qwen3TTSTokenizerV2Config, Qwen3TTSTokenizerV2Model)
+        model_type = cls._detect_model_type(pretrained_model_name_or_path, **kwargs)
+        cls._safe_register(model_type)
 
         inst.feature_extractor = AutoFeatureExtractor.from_pretrained(pretrained_model_name_or_path)
         inst.model = AutoModel.from_pretrained(pretrained_model_name_or_path, **kwargs)

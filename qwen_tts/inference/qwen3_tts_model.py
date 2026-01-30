@@ -351,6 +351,88 @@ class Qwen3TTSModel:
         )
         return merged
 
+    def _require_12hz_tokenizer_for_streaming(self) -> None:
+        tok = getattr(self.model, "speech_tokenizer", None)
+        if tok is None:
+            raise RuntimeError("speech_tokenizer is not loaded on the model.")
+        mt = getattr(tok, "get_model_type", None)
+        model_type = mt() if callable(mt) else None
+        if model_type != "qwen3_tts_tokenizer_12hz":
+            raise NotImplementedError(
+                f"Streaming decode is currently implemented for tokenizer_12hz only; got {model_type!r}."
+            )
+
+    def _decode_stream_chunk(
+        self,
+        codes_chunk: torch.Tensor,
+        *,
+        context_codes: Optional[torch.Tensor],
+        left_context_frames: int,
+        decode_upsample_rate: int,
+    ) -> Tuple[np.ndarray, int, Optional[torch.Tensor]]:
+        if codes_chunk is None or not torch.is_tensor(codes_chunk) or codes_chunk.numel() == 0:
+            return np.zeros((0,), dtype=np.float32), int(self.model.speech_tokenizer.get_output_sample_rate()), context_codes
+
+        codes_chunk = codes_chunk.to(dtype=torch.long)
+
+        if context_codes is not None and torch.is_tensor(context_codes) and context_codes.numel() > 0:
+            ctx = context_codes.to(dtype=torch.long)
+            codes_for_decode = torch.cat([ctx, codes_chunk], dim=0)
+            ctx_frames = int(ctx.shape[0])
+        else:
+            codes_for_decode = codes_chunk
+            ctx_frames = 0
+
+        wavs, sr = self.model.speech_tokenizer.decode([{"audio_codes": codes_for_decode}])
+        wav = wavs[0].astype(np.float32, copy=False)
+
+        # IMPORTANT:
+        # The decoded waveform length is not guaranteed to be exactly `num_frames * decode_upsample_rate`.
+        # Use a ratio-based cut (same idea as the non-streaming path that removes ref_code audio),
+        # otherwise boundaries can overlap or have gaps, which sounds like stuttering.
+        drop = 0
+        total_frames = int(codes_for_decode.shape[0])
+        if ctx_frames > 0 and total_frames > 0 and wav.shape[0] > 0:
+            drop = int(round((float(ctx_frames) / float(total_frames)) * float(wav.shape[0])))
+        elif ctx_frames > 0:
+            drop = int(ctx_frames) * int(decode_upsample_rate)
+        if drop > 0 and wav.shape[0] > drop:
+            wav = wav[drop:]
+        elif drop > 0:
+            wav = wav[:0]
+
+        next_ctx: Optional[torch.Tensor] = None
+        if left_context_frames > 0:
+            take = min(int(left_context_frames), int(codes_for_decode.shape[0]))
+            if take > 0:
+                next_ctx = codes_for_decode[-take:]
+        return wav, int(sr), next_ctx
+
+    def _stream_decode_codes(
+        self,
+        codes_iter,
+        *,
+        ref_code: Optional[torch.Tensor] = None,
+        left_context_frames: int = 25,
+    ):
+        self._require_12hz_tokenizer_for_streaming()
+        decode_upsample_rate = int(self.model.speech_tokenizer.get_decode_upsample_rate())
+
+        context_codes: Optional[torch.Tensor] = None
+        if ref_code is not None and torch.is_tensor(ref_code) and ref_code.numel() > 0 and left_context_frames > 0:
+            take = min(int(left_context_frames), int(ref_code.shape[0]))
+            context_codes = ref_code.to(dtype=torch.long)[-take:]
+
+        for chunk in codes_iter:
+            wav, sr, context_codes = self._decode_stream_chunk(
+                chunk,
+                context_codes=context_codes,
+                left_context_frames=int(left_context_frames),
+                decode_upsample_rate=decode_upsample_rate,
+            )
+            if wav.size:
+                yield wav, sr
+
     # voice clone model
     @torch.inference_mode()
     def create_voice_clone_prompt(
@@ -417,19 +499,24 @@ class Qwen3TTSModel:
 
         normalized = self._normalize_audio_inputs(ref_audio_list)
 
-        ref_wavs_for_code: List[np.ndarray] = []
-        ref_sr_for_code: List[int] = []
-        for wav, sr in normalized:
-            ref_wavs_for_code.append(wav)
-            ref_sr_for_code.append(sr)
+        ref_codes: List[Optional[torch.Tensor]] = [None] * len(normalized)
+        need_code_indices = [i for i, xvec_only in enumerate(xvec_list) if not bool(xvec_only)]
+        if need_code_indices:
+            ref_wavs_for_code: List[np.ndarray] = []
+            ref_sr_for_code: List[int] = []
+            for idx in need_code_indices:
+                wav, sr = normalized[idx]
+                ref_wavs_for_code.append(wav)
+                ref_sr_for_code.append(int(sr))
 
-        if len(set(ref_sr_for_code)) == 1:
-            enc = self.model.speech_tokenizer.encode(ref_wavs_for_code, sr=ref_sr_for_code[0])
-            ref_codes = enc.audio_codes
-        else:
-            ref_codes = []
-            for wav, sr in normalized:
-                ref_codes.append(self.model.speech_tokenizer.encode(wav, sr=sr).audio_codes[0])
+            if len(set(ref_sr_for_code)) == 1:
+                enc = self.model.speech_tokenizer.encode(ref_wavs_for_code, sr=ref_sr_for_code[0])
+                for idx, code in zip(need_code_indices, enc.audio_codes):
+                    ref_codes[idx] = code
+            else:
+                for idx in need_code_indices:
+                    wav, sr = normalized[idx]
+                    ref_codes[idx] = self.model.speech_tokenizer.encode(wav, sr=int(sr)).audio_codes[0]
 
         items: List[VoiceClonePromptItem] = []
         for i, ((wav, sr), code, rtext, xvec_only) in enumerate(zip(normalized, ref_codes, ref_text_list, xvec_list)):
@@ -632,6 +719,87 @@ class Qwen3TTSModel:
 
         return wavs_out, fs
 
+    @torch.no_grad()
+    def generate_voice_clone_stream(
+        self,
+        text: str,
+        language: str = None,
+        *,
+        ref_audio: Optional[AudioLike] = None,
+        ref_text: Optional[str] = None,
+        x_vector_only_mode: bool = False,
+        voice_clone_prompt: Optional[Union[Dict[str, Any], List[VoiceClonePromptItem]]] = None,
+        chunk_seconds: float = 0.5,
+        left_context_frames: int = 25,
+        non_streaming_mode: bool = False,
+        **kwargs,
+    ):
+        if self.model.tts_model_type != "base":
+            raise ValueError("generate_voice_clone_stream is only supported for Base models.")
+        if not text or not str(text).strip():
+            raise ValueError("`text` is required.")
+
+        texts = [str(text).strip()]
+        languages = [language if language is not None else "Auto"]
+        self._validate_languages(languages)
+
+        if voice_clone_prompt is None:
+            if ref_audio is None:
+                raise ValueError("Either `voice_clone_prompt` or `ref_audio` must be provided.")
+            prompt_items = self.create_voice_clone_prompt(
+                ref_audio=ref_audio,
+                ref_text=ref_text,
+                x_vector_only_mode=bool(x_vector_only_mode),
+            )
+        else:
+            if isinstance(voice_clone_prompt, list):
+                prompt_items = voice_clone_prompt
+            else:
+                # dict form is accepted by core model, but for streaming we need ref_code for warmup.
+                raise ValueError("For streaming, pass `voice_clone_prompt` as a list[VoiceClonePromptItem].")
+
+        if len(prompt_items) != 1:
+            raise NotImplementedError("generate_voice_clone_stream currently supports a single prompt item.")
+
+        voice_clone_prompt_dict = self._prompt_items_to_voice_clone_prompt(prompt_items)
+        ref_texts_for_ids = [prompt_items[0].ref_text]
+
+        input_texts = [self._build_assistant_text(t) for t in texts]
+        input_ids = self._tokenize_texts(input_texts)
+
+        ref_ids = []
+        for rt in ref_texts_for_ids:
+            if rt is None or rt == "":
+                ref_ids.append(None)
+            else:
+                ref_ids.append(self._tokenize_texts([self._build_ref_text(rt)])[0])
+
+        gen_kwargs = self._merge_generate_kwargs(**kwargs)
+
+        # Derive a reasonable codec-chunk size from seconds.
+        out_sr = int(self.model.speech_tokenizer.get_output_sample_rate())
+        up = int(self.model.speech_tokenizer.get_decode_upsample_rate())
+        fps = float(out_sr) / float(up) if up > 0 else 12.0
+        frames_per_chunk = max(1, int(round(float(chunk_seconds) * fps)))
+
+        codes_iter = self.model.generate_stream(
+            input_ids=input_ids,
+            ref_ids=ref_ids,
+            voice_clone_prompt=voice_clone_prompt_dict,
+            languages=languages,
+            non_streaming_mode=non_streaming_mode,
+            stream_chunk_size=frames_per_chunk,
+            **gen_kwargs,
+        )
+
+        ref_code = voice_clone_prompt_dict.get("ref_code", [None])[0]
+        for wav, sr in self._stream_decode_codes(
+            codes_iter,
+            ref_code=ref_code,
+            left_context_frames=int(left_context_frames),
+        ):
+            yield wav, sr
+
     # voice design model
     @torch.no_grad()
     def generate_voice_design(
@@ -726,6 +894,57 @@ class Qwen3TTSModel:
 
         wavs, fs = self.model.speech_tokenizer.decode([{"audio_codes": c} for c in talker_codes_list])
         return wavs, fs
+
+    @torch.no_grad()
+    def generate_voice_design_stream(
+        self,
+        text: str,
+        instruct: str,
+        language: str = None,
+        *,
+        chunk_seconds: float = 0.5,
+        left_context_frames: int = 25,
+        non_streaming_mode: bool = True,
+        **kwargs,
+    ):
+        if self.model.tts_model_type != "voice_design":
+            raise ValueError("generate_voice_design_stream is only supported for VoiceDesign models.")
+        if not text or not str(text).strip():
+            raise ValueError("`text` is required.")
+        if not instruct or not str(instruct).strip():
+            raise ValueError("`instruct` is required.")
+
+        texts = [str(text).strip()]
+        languages = [language if language is not None else "Auto"]
+        instructs = [str(instruct).strip()]
+
+        self._validate_languages(languages)
+
+        input_ids = self._tokenize_texts([self._build_assistant_text(t) for t in texts])
+        instruct_ids = [self._tokenize_texts([self._build_instruct_text(ins)])[0] if ins else None for ins in instructs]
+
+        gen_kwargs = self._merge_generate_kwargs(**kwargs)
+
+        out_sr = int(self.model.speech_tokenizer.get_output_sample_rate())
+        up = int(self.model.speech_tokenizer.get_decode_upsample_rate())
+        fps = float(out_sr) / float(up) if up > 0 else 12.0
+        frames_per_chunk = max(1, int(round(float(chunk_seconds) * fps)))
+
+        codes_iter = self.model.generate_stream(
+            input_ids=input_ids,
+            instruct_ids=instruct_ids,
+            languages=languages,
+            non_streaming_mode=non_streaming_mode,
+            stream_chunk_size=frames_per_chunk,
+            **gen_kwargs,
+        )
+
+        for wav, sr in self._stream_decode_codes(
+            codes_iter,
+            ref_code=None,
+            left_context_frames=int(left_context_frames),
+        ):
+            yield wav, sr
 
     # custom voice model
     @torch.no_grad()
@@ -837,6 +1056,64 @@ class Qwen3TTSModel:
 
         wavs, fs = self.model.speech_tokenizer.decode([{"audio_codes": c} for c in talker_codes_list])
         return wavs, fs
+
+    @torch.no_grad()
+    def generate_custom_voice_stream(
+        self,
+        text: str,
+        speaker: str,
+        language: str = None,
+        *,
+        instruct: Optional[str] = None,
+        chunk_seconds: float = 0.5,
+        left_context_frames: int = 25,
+        non_streaming_mode: bool = True,
+        **kwargs,
+    ):
+        if self.model.tts_model_type != "custom_voice":
+            raise ValueError("generate_custom_voice_stream is only supported for CustomVoice models.")
+        if not text or not str(text).strip():
+            raise ValueError("`text` is required.")
+        if not speaker or not str(speaker).strip():
+            raise ValueError("`speaker` is required.")
+
+        texts = [str(text).strip()]
+        languages = [language if language is not None else "Auto"]
+        speakers = [str(speaker).strip()]
+
+        if self.model.tts_model_size in "0b6":
+            instruct = None
+        instructs = [str(instruct).strip()] if instruct else [""]
+
+        self._validate_languages(languages)
+        self._validate_speakers(speakers)
+
+        input_ids = self._tokenize_texts([self._build_assistant_text(t) for t in texts])
+        instruct_ids = [self._tokenize_texts([self._build_instruct_text(ins)])[0] if ins else None for ins in instructs]
+
+        gen_kwargs = self._merge_generate_kwargs(**kwargs)
+
+        out_sr = int(self.model.speech_tokenizer.get_output_sample_rate())
+        up = int(self.model.speech_tokenizer.get_decode_upsample_rate())
+        fps = float(out_sr) / float(up) if up > 0 else 12.0
+        frames_per_chunk = max(1, int(round(float(chunk_seconds) * fps)))
+
+        codes_iter = self.model.generate_stream(
+            input_ids=input_ids,
+            instruct_ids=instruct_ids,
+            languages=languages,
+            speakers=speakers,
+            non_streaming_mode=non_streaming_mode,
+            stream_chunk_size=frames_per_chunk,
+            **gen_kwargs,
+        )
+
+        for wav, sr in self._stream_decode_codes(
+            codes_iter,
+            ref_code=None,
+            left_context_frames=int(left_context_frames),
+        ):
+            yield wav, sr
 
 
     def get_supported_speakers(self) -> Optional[List[str]]:
